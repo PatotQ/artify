@@ -1,4 +1,4 @@
-# Artify — buscador de convocatorias de arte
+# Artify — buscador de convocatorias de arte para el amor de mi vida, Fla ❤️
 # UI prolija + scraper robusto + paralelo + sin crasheos por fechas
 
 import re, io, csv, time, urllib.parse
@@ -11,7 +11,10 @@ from bs4 import BeautifulSoup
 import streamlit as st
 
 # ---------- Config general ----------
-st.set_page_config(page_title="Artify — buscador de convocatorias de arte", layout="wide")
+st.set_page_config(
+    page_title="Artify — buscador de convocatorias de arte para el amor de mi vida, Fla ❤️",
+    layout="wide"
+)
 YEAR = date.today().year
 
 MAX_WORKERS = 12
@@ -45,17 +48,20 @@ def parse_spanish_date(txt: str):
     s = s.replace("º","").replace("°","")
     s = re.sub(r"(\d)(?:st|nd|rd|th)", r"\1", s)
 
+    # 12 de agosto de 2025
     m = re.search(r"(\d{1,2})\s+de\s+([a-zá]+)\s+de\s+(\d{4})", s)
     if m:
         d = int(m.group(1)); mon = m.group(2).replace("á","a"); y = int(m.group(3))
         if mon in MONTHS: return _mk_date(y, MONTHS[mon], d)
 
+    # 12/08/2025 o 12-08-25
     m = re.search(r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})", s)
     if m:
         a = int(m.group(1)); b = int(m.group(2)); y = int(m.group(3))
         if y < 100: y += 2000
         return _mk_date(y, b, a) or _mk_date(y, a, b)
 
+    # 12.08.2025
     m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", s)
     if m:
         d, mm, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -366,7 +372,7 @@ def gather_fallback():
     return out
 
 # ---------- UI ----------
-st.title("✨ Artify — buscador de convocatorias de arte")
+st.title("✨ Artify — buscador de convocatorias de arte para el amor de mi vida, Fla ❤️")
 st.caption("Resultados ordenados por fecha, con resumen, dificultad (1–100) y export a CSV/ICS.")
 
 with st.sidebar:
@@ -473,6 +479,7 @@ if st.button("🔎 Buscar convocatorias", type="primary"):
 
     # export
     if items:
+        # CSV
         buf=io.StringIO(); w=csv.writer(buf)
         w.writerow(["title","url","source","type","location","scope","open_at","deadline","difficulty","prize","slots","fee","summary"])
         for c in items:
@@ -483,6 +490,25 @@ if st.button("🔎 Buscar convocatorias", type="primary"):
                 c["difficulty"], c["prize"], c["slots"], c["fee"], c["summary"]
             ])
         st.download_button("⬇️ Exportar CSV", buf.getvalue(), "artify_convocatorias.csv", "text/csv")
+
+        # ICS
+        def make_ics(items):
+            def dtfmt(d): return d.strftime("%Y%m%d")
+            ics = ["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//Artify//Convocatorias//ES"]
+            for c in items:
+                if not c.get("deadline"): continue
+                desc = (c.get("summary","")[:200]).replace("\n"," ")
+                ics += [
+                    "BEGIN:VEVENT",
+                    f"SUMMARY:{c['title']} (cierra)",
+                    f"DTSTART;VALUE=DATE:{dtfmt(c['deadline'])}",
+                    f"DTEND;VALUE=DATE:{dtfmt(c['deadline'] + timedelta(days=1))}",
+                    f"DESCRIPTION:{desc}  URL: {c.get('url','')}",
+                    "END:VEVENT"
+                ]
+            ics.append("END:VCALENDAR")
+            return "\n".join(ics)
+        st.download_button("📅 Exportar calendario (ICS)", make_ics(items), "artify_convocatorias.ics", "text/calendar")
 
 else:
     st.info("Elegí filtros y apretá **Buscar convocatorias**. Probá 40–80 páginas para traer 20+ resultados.")
