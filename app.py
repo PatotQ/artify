@@ -1,3 +1,4 @@
+
 import re
 from datetime import datetime, timedelta, date
 from urllib.parse import urljoin
@@ -17,8 +18,15 @@ SOURCES = {
     "bandadas_home": "https://www.bandadas.com/",
 }
 
+# Toggle por fuente para evitar que una sola rompa todo
+ENABLED_SOURCES = {
+    "artealdia": True,
+    "catalogos": True,
+    "bandadas": True,  # solo público
+}
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
 
 DATE_PATTERNS = [
@@ -114,12 +122,18 @@ def safe_get_text(el):
     return _re.sub(r"\s+", " ", (el.get_text(" ").strip() if el else "")).strip()
 
 def fetch(url):
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    return r.text
+    # Timeout (connect=5s, read=15s) y manejo de errores no-bloqueante
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=(5, 15))
+        r.raise_for_status()
+        return r.text
+    except Exception as e:
+        return None
 
 def scrape_artealdia_list(url):
     html = fetch(url)
+    if not html:
+        return []
     soup = BeautifulSoup(html, "html.parser")
     cards = []
     for art in soup.select("article, .views-row, .node-teaser, .grid__item"):
@@ -140,6 +154,7 @@ def scrape_artealdia_list(url):
                 "type": guess_type((title or "") + " " + summary),
                 "open_at": None,
             })
+    # Dedup
     seen = set(); uniq = []
     for c in cards:
         key = (c["title"], c["url"])
@@ -149,6 +164,8 @@ def scrape_artealdia_list(url):
 
 def scrape_catalogos_convocatorias(url):
     html = fetch(url)
+    if not html:
+        return []
     soup = BeautifulSoup(html, "html.parser")
     items = []
     for block in soup.select("main, .blog, .entry, article"):
@@ -188,6 +205,8 @@ def scrape_catalogos_convocatorias(url):
 
 def scrape_bandadas_public(url):
     html = fetch(url)
+    if not html:
+        return []
     soup = BeautifulSoup(html, "html.parser")
     items = []
     for h in soup.select("h2, h3"):
@@ -206,19 +225,22 @@ def scrape_bandadas_public(url):
 
 def gather_all():
     records = []
-    for key in ["artealdia_main", "artealdia_tag_convocatorias", "artealdia_tag_convocatoria"]:
+    if ENABLED_SOURCES.get("artealdia"):
+        for key in ["artealdia_main", "artealdia_tag_convocatorias", "artealdia_tag_convocatoria"]:
+            try:
+                records += scrape_artealdia_list(SOURCES[key])
+            except Exception as e:
+                st.warning(f"Arte Al Día off: {e}")
+    if ENABLED_SOURCES.get("catalogos"):
         try:
-            records += scrape_artealdia_list(SOURCES[key])
+            records += scrape_catalogos_convocatorias(SOURCES["catalogos_convocatorias"])
         except Exception as e:
-            st.warning(f"Problema al leer Arte Al Día ({key}): {e}")
-    try:
-        records += scrape_catalogos_convocatorias(SOURCES["catalogos_convocatorias"])
-    except Exception as e:
-        st.warning(f"Problema al leer Catálogos para Artistas: {e}")
-    try:
-        records += scrape_bandadas_public(SOURCES["bandadas_home"])
-    except Exception as e:
-        st.info("Bandadas requiere login para ver listados en detalle; se capturó lo público.")
+            st.warning(f"Catálogos off: {e}")
+    if ENABLED_SOURCES.get("bandadas"):
+        try:
+            records += scrape_bandadas_public(SOURCES["bandadas_home"])
+        except Exception as e:
+            st.info("Bandadas requiere login; usando lo público.")
     return records
 
 def normalize_df(records):
@@ -240,20 +262,32 @@ def normalize_df(records):
     return df
 
 st.title("🎨 Artify — Convocatorias para Fla")
-st.caption("Escanea Arte Al Día, Catálogos para Artistas y lo público de Bandadas. Estima dificultad, detecta solapamientos y sugiere el tipo de obra.")
+st.caption("Cargá las convocatorias cuando quieras. Si alguna fuente falla, desactivala en el panel de la izquierda.")
 
-if st.button("🔄 Actualizar"):
-    st.session_state.pop("df", None)
+# Sidebar: controles y fuentes
+with st.sidebar:
+    st.header("Fuentes")
+    arte = st.checkbox("Arte Al Día", value=ENABLED_SOURCES["artealdia"])
+    cata = st.checkbox("Catálogos para Artistas", value=ENABLED_SOURCES["catalogos"])
+    band = st.checkbox("Bandadas (público)", value=ENABLED_SOURCES["bandadas"])
+    ENABLED_SOURCES.update({"artealdia": arte, "catalogos": cata, "bandadas": band})
+    st.divider()
+    st.caption("Tip: si tarda o hay error de red, desactivá la fuente problemática y volvés a cargar.")
 
-if "df" not in st.session_state:
-    with st.spinner("Buscando convocatorias…"):
+# Lazy-load: solo busca cuando el usuario lo pide
+col1, col2 = st.columns([1,3])
+with col1:
+    load = st.button("🔎 Cargar convocatorias")
+
+if load:
+    with st.spinner("Buscando convocatorias… (tiempo máx ~20–30s)"):
         recs = gather_all()
         st.session_state["df"] = normalize_df(recs)
 
-df = st.session_state["df"].copy()
+df = st.session_state.get("df")
 
-if df.empty:
-    st.info("No se encontraron convocatorias en las fuentes, o cambió el HTML. Probá nuevamente más tarde.")
+if df is None or df.empty:
+    st.info("Apretá **Cargar convocatorias** para comenzar. Si ya cargaste y no ves resultados, probá desactivar alguna fuente y volver a cargar.")
     st.stop()
 
 types = ["all"] + sorted(df["type"].dropna().unique().tolist())
