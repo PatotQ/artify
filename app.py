@@ -10,6 +10,9 @@ import streamlit as st
 
 st.set_page_config(page_title="Artify — Convocatorias para Fla", layout="wide")
 
+# -----------------------------
+# Config
+# -----------------------------
 SOURCES = {
     "artealdia_main": "https://es.artealdia.com/Convocatorias",
     "artealdia_tag_convocatorias": "https://es.artealdia.com/Tags/%28tag%29/Convocatorias",
@@ -18,17 +21,16 @@ SOURCES = {
     "bandadas_home": "https://www.bandadas.com/",
 }
 
-# Toggle por fuente para evitar que una sola rompa todo
-ENABLED_SOURCES = {
-    "artealdia": True,
-    "catalogos": True,
-    "bandadas": True,  # solo público
-}
-
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
 
+REQUEST_TIMEOUT = 8  # seg por request
+TOTAL_TIMEOUT = 25   # seg total por scraping
+
+# -----------------------------
+# Utils
+# -----------------------------
 DATE_PATTERNS = [
     r"(?:fecha(?:\s+l[ií]mite)?(?:\s+de)?\s*(?:aplicaci[oó]n|postulaci[oó]n|cierre|presentaci[oó]n)?:?\s*)(\d{1,2}\s+de\s+\w+\s+\d{4})",
     r"(?:cierran?\s+el\s+|cierra\s+el\s+)(\d{1,2}\s+de\s+\w+\s+\d{4})",
@@ -121,19 +123,16 @@ def safe_get_text(el):
     import re as _re
     return _re.sub(r"\s+", " ", (el.get_text(" ").strip() if el else "")).strip()
 
+# -----------------------------
+# Scrapers (robustos y con timeouts)
+# -----------------------------
 def fetch(url):
-    # Timeout (connect=5s, read=15s) y manejo de errores no-bloqueante
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=(5, 15))
-        r.raise_for_status()
-        return r.text
-    except Exception as e:
-        return None
+    r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.text
 
 def scrape_artealdia_list(url):
     html = fetch(url)
-    if not html:
-        return []
     soup = BeautifulSoup(html, "html.parser")
     cards = []
     for art in soup.select("article, .views-row, .node-teaser, .grid__item"):
@@ -160,12 +159,10 @@ def scrape_artealdia_list(url):
         key = (c["title"], c["url"])
         if key in seen: continue
         seen.add(key); uniq.append(c)
-    return uniq
+    return uniq[:25]  # recorte sano
 
 def scrape_catalogos_convocatorias(url):
     html = fetch(url)
-    if not html:
-        return []
     soup = BeautifulSoup(html, "html.parser")
     items = []
     for block in soup.select("main, .blog, .entry, article"):
@@ -196,17 +193,17 @@ def scrape_catalogos_convocatorias(url):
                     "type": guess_type(t),
                     "open_at": None,
                 })
+    # Dedup
     seen=set(); uniq=[]
     for c in items:
         key=(c["title"], c["url"])
         if key in seen: continue
         seen.add(key); uniq.append(c)
-    return uniq
+    return uniq[:25]
 
 def scrape_bandadas_public(url):
+    # Bandadas puede bloquear; manejamos errores
     html = fetch(url)
-    if not html:
-        return []
     soup = BeautifulSoup(html, "html.parser")
     items = []
     for h in soup.select("h2, h3"):
@@ -221,26 +218,34 @@ def scrape_bandadas_public(url):
                 "type": guess_type(t),
                 "open_at": None,
             })
-    return items
+    return items[:15]
 
-def gather_all():
+def gather_all(enabled):
     records = []
-    if ENABLED_SOURCES.get("artealdia"):
-        for key in ["artealdia_main", "artealdia_tag_convocatorias", "artealdia_tag_convocatoria"]:
-            try:
+    import time
+    start = time.time()
+    if enabled.get("artealdia"):
+        try:
+            for key in ["artealdia_main", "artealdia_tag_convocatorias", "artealdia_tag_convocatoria"]:
                 records += scrape_artealdia_list(SOURCES[key])
-            except Exception as e:
-                st.warning(f"Arte Al Día off: {e}")
-    if ENABLED_SOURCES.get("catalogos"):
+        except Exception as e:
+            st.warning(f"Arte Al Día off: {e}")
+    if time.time() - start > TOTAL_TIMEOUT:
+        return records
+
+    if enabled.get("catalogos"):
         try:
             records += scrape_catalogos_convocatorias(SOURCES["catalogos_convocatorias"])
         except Exception as e:
             st.warning(f"Catálogos off: {e}")
-    if ENABLED_SOURCES.get("bandadas"):
+    if time.time() - start > TOTAL_TIMEOUT:
+        return records
+
+    if enabled.get("bandadas"):
         try:
             records += scrape_bandadas_public(SOURCES["bandadas_home"])
         except Exception as e:
-            st.info("Bandadas requiere login; usando lo público.")
+            st.warning("Bandadas requiere login; usando lo público (o desactivar si tarda).")
     return records
 
 def normalize_df(records):
@@ -261,85 +266,96 @@ def normalize_df(records):
     df["deadline"] = df["deadline"].apply(coerce_deadline)
     return df
 
+# -----------------------------
+# UI (nunca scrapea al cargar)
+# -----------------------------
 st.title("🎨 Artify — Convocatorias para Fla")
-st.caption("Cargá las convocatorias cuando quieras. Si alguna fuente falla, desactivala en el panel de la izquierda.")
+st.caption("Carga manual, timeouts cortos y fuentes conmutables para que no se cuelgue.")
 
-# Sidebar: controles y fuentes
 with st.sidebar:
     st.header("Fuentes")
-    arte = st.checkbox("Arte Al Día", value=ENABLED_SOURCES["artealdia"])
-    cata = st.checkbox("Catálogos para Artistas", value=ENABLED_SOURCES["catalogos"])
-    band = st.checkbox("Bandadas (público)", value=ENABLED_SOURCES["bandadas"])
-    ENABLED_SOURCES.update({"artealdia": arte, "catalogos": cata, "bandadas": band})
-    st.divider()
-    st.caption("Tip: si tarda o hay error de red, desactivá la fuente problemática y volvés a cargar.")
+    enabled = {
+        "artealdia": st.checkbox("Arte Al Día", value=True),
+        "catalogos": st.checkbox("Catálogos para Artistas", value=True),
+        "bandadas": st.checkbox("Bandadas (público)", value=False),
+    }
+    st.caption("Si tarda, apagá Bandadas y reintentá.")
 
-# Lazy-load: solo busca cuando el usuario lo pide
-col1, col2 = st.columns([1,3])
-with col1:
-    load = st.button("🔎 Cargar convocatorias")
+if st.button("🔎 Cargar convocatorias"):
+    with st.spinner("Buscando convocatorias…"):
+        recs = gather_all(enabled)
+        df = normalize_df(recs)
 
-if load:
-    with st.spinner("Buscando convocatorias… (tiempo máx ~20–30s)"):
-        recs = gather_all()
-        st.session_state["df"] = normalize_df(recs)
+    if df.empty:
+        st.info("No encontramos nada o las fuentes cambiaron. Te mostramos un ejemplo para que veas el formato.")
+        df = pd.DataFrame([
+            {
+                "title": "Ejemplo — Premio X 2025",
+                "source": "Demo",
+                "type": "prize",
+                "deadline": date.today() + timedelta(days=20),
+                "open_at": date.today() - timedelta(days=5),
+                "url": "https://ejemplo.org/convocatoria",
+                "summary": "Convocatoria de ejemplo con premio en efectivo. Fecha límite en 20 días.",
+                "difficulty_pct": 0.14,
+                "fit_tip": "Serie pictórica (6–10 obras) con statement curado."
+            }
+        ])
 
-df = st.session_state.get("df")
+    # Filtros
+    types = ["all"] + sorted(df["type"].dropna().unique().tolist())
+    t_sel = st.selectbox("Tipo", types, index=0)
 
-if df is None or df.empty:
-    st.info("Apretá **Cargar convocatorias** para comenzar. Si ya cargaste y no ves resultados, probá desactivar alguna fuente y volver a cargar.")
-    st.stop()
+    today = date.today()
+    max_deadline = df["deadline"].dropna().max() if not df["deadline"].dropna().empty else (today + timedelta(days=120))
+    deadline_range = st.slider("Fecha de cierre (rango)", min_value=today, max_value=max_deadline, value=(today, max_deadline))
 
-types = ["all"] + sorted(df["type"].dropna().unique().tolist())
-t_sel = st.selectbox("Tipo", types, index=0)
+    if t_sel != "all":
+        df = df[df["type"] == t_sel]
 
-today = date.today()
-max_deadline = df["deadline"].dropna().max() if not df["deadline"].dropna().empty else (today + timedelta(days=120))
-deadline_range = st.slider("Fecha de cierre (rango)", min_value=today, max_value=max_deadline, value=(today, max_deadline))
+    df = df[(df["deadline"].isna()) | ((df["deadline"] >= deadline_range[0]) & (df["deadline"] <= deadline_range[1]))]
 
-if t_sel != "all":
-    df = df[df["type"] == t_sel]
+    # Overlaps
+    def compute_overlaps(df):
+        overlaps = {}
+        rows = df.reset_index()
+        for i, a in rows.iterrows():
+            a_start, a_end = a["open_at"], a["deadline"] or (today + timedelta(days=30))
+            for j, b in rows.iterrows():
+                if j <= i: continue
+                b_start, b_end = b["open_at"], b["deadline"] or (today + timedelta(days=30))
+                if overlap(a_start, a_end, b_start, b_end):
+                    overlaps.setdefault(a["index"], []).append(b["index"])
+                    overlaps.setdefault(b["index"], []).append(a["index"])
+        return overlaps
 
-df = df[(df["deadline"].isna()) | ((df["deadline"] >= deadline_range[0]) & (df["deadline"] <= deadline_range[1]))]
+    overlaps_map = compute_overlaps(df)
+    df = df.sort_values(by=["deadline"], ascending=[True])
+    csv = df.to_csv(index=False)
+    st.download_button("⬇️ Exportar CSV", data=csv, file_name="convocatorias_artify.csv", mime="text/csv")
 
-def compute_overlaps(df):
-    overlaps = {}
-    rows = df.reset_index()
-    for i, a in rows.iterrows():
-        a_start, a_end = a["open_at"], a["deadline"] or (today + timedelta(days=30))
-        for j, b in rows.iterrows():
-            if j <= i: continue
-            b_start, b_end = b["open_at"], b["deadline"] or (today + timedelta(days=30))
-            if overlap(a_start, a_end, b_start, b_end):
-                overlaps.setdefault(a["index"], []).append(b["index"])
-                overlaps.setdefault(b["index"], []).append(a["index"])
-    return overlaps
+    st.markdown("---")
+    for idx, row in df.iterrows():
+        with st.container(border=True):
+            c1, c2 = st.columns([3,1])
+            with c1:
+                st.subheader(row["title"])
+                st.markdown(f"**Fuente:** {row['source']}  •  **Tipo:** `{row['type']}`")
+                dl_txt = row["deadline"].strftime("%d/%m/%Y") if isinstance(row["deadline"], (datetime, date)) else "Sin dato"
+                st.markdown(f"**Cierra:** {dl_txt}")
+                st.markdown(f"[Abrir convocatoria]({row['url']})")
+                if row.get("summary"):
+                    st.write(row["summary"][:500] + ("…" if len(row["summary"])>500 else ""))
+            with c2:
+                st.metric("Dificultad estimada", human_pct(row["difficulty_pct"]))
+                peers = overlaps_map.get(idx, [])
+                if peers:
+                    st.warning(f"Se solapa con {len(peers)} otra(s).")
+                st.caption("Tip de obra:")
+                st.write("• " + row["fit_tip"])
 
-overlaps_map = compute_overlaps(df)
-df = df.sort_values(by=["deadline"], ascending=[True])
-csv = df.to_csv(index=False)
-st.download_button("⬇️ Exportar CSV", data=csv, file_name="convocatorias_artify.csv", mime="text/csv")
+    st.markdown("---")
+    st.caption("Si alguna fuente tarda, desactívala y reintentá.")
 
-st.markdown("---")
-
-for idx, row in df.iterrows():
-    with st.container(border=True):
-        c1, c2 = st.columns([3,1])
-        with c1:
-            st.subheader(row["title"])
-            st.markdown(f"**Fuente:** {row['source']}  •  **Tipo:** `{row['type']}`")
-            dl_txt = row["deadline"].strftime("%d/%m/%Y") if isinstance(row["deadline"], (datetime, date)) else "Sin dato"
-            st.markdown(f"**Cierra:** {dl_txt}")
-            st.markdown(f"[Abrir convocatoria]({row['url']})")
-            if row.get("summary"):
-                st.write(row["summary"][:500] + ("…" if len(row["summary"])>500 else ""))
-        with c2:
-            st.metric("Dificultad estimada", human_pct(row["difficulty_pct"]))
-            peers = overlaps_map.get(idx, [])
-            if peers:
-                st.warning(f"Se solapa con {len(peers)} otra(s).")
-            st.caption("Tip de obra:")
-            st.write("• " + row["fit_tip"])
-
-st.markdown("---")
-st.caption("Heurística experimental. Si ves algo raro, ajustamos scrapers y reglas.")
+else:
+    st.info("Listo para usar. Elegí las fuentes en la izquierda y tocá **“🔎 Cargar convocatorias”** para empezar.")
