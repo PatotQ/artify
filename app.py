@@ -1,14 +1,12 @@
-# Artify — versión PRO pulida (lite, sin pandas)
-# - Ordena por fecha hasta fin de año
-# - Título correcto, URL aparte, resumen breve
-# - Inicio / Cierre, locación, dificultad 1–100 (100 = más difícil)
-# - Filtros por tipo, texto y Ámbito (AR / Fuera de AR)
-# - Export CSV + ICS
-# - Bandadas opcional con st.secrets
+# Artify — MetaBuscador de Convocatorias (lite, sin pandas)
+# - Usa DDG HTML como metabuscador (evita Google bloqueos)
+# - Visita resultados y extrae: título limpio, URL, inicio/cierre, días, locación, tipo, dificultad 1–100, resumen
+# - Filtros por texto, tipo y ámbito (AR / Fuera de AR). Orden por fecha.
+# - Mantiene fuentes iniciales y Bandadas (via st.secrets) como extras.
 
-import re, io, csv, time
+import re, io, csv, time, urllib.parse
 from datetime import date, timedelta
-from urllib.parse import urljoin
+from urllib.parse import urlparse, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -16,26 +14,12 @@ import streamlit as st
 
 st.set_page_config(page_title="Artify — Convocatorias", layout="wide")
 YEAR = date.today().year
-
-SOURCES = {
-    "artealdia_main": "https://es.artealdia.com/Convocatorias",
-    "artealdia_tag_convocatorias": "https://es.artealdia.com/Tags/%28tag%29/Convocatorias",
-    "artealdia_tag_convocatoria": "https://es.artealdia.com/Tags/%28tag%29/Convocatoria",
-    "catalogos_convocatorias": "https://www.catalogosparaartistas.com/convocatorias",
-    "bandadas_login": "https://www.bandadas.com/login",
-    "bandadas_convoc": "https://www.bandadas.com/convocation",
-}
-
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-REQUEST_TIMEOUT = 8
-TOTAL_HARD_LIMIT = 30
+REQ_TIMEOUT = 8
+TOTAL_HARD_LIMIT = 35  # seg por búsqueda
 
-# ---------- Fechas ----------
-MONTHS = {
-    'enero':1,'febrero':2,'marzo':3,'abril':4,'mayo':5,'junio':6,
-    'julio':7,'agosto':8,'septiembre':9,'setiembre':9,'octubre':10,'noviembre':11,'diciembre':12
-}
-
+# ---------- helpers fecha ----------
+MONTHS = {'enero':1,'febrero':2,'marzo':3,'abril':4,'mayo':5,'junio':6,'julio':7,'agosto':8,'septiembre':9,'setiembre':9,'octubre':10,'noviembre':11,'diciembre':12}
 def parse_spanish_date(txt: str):
     if not txt: return None
     s = txt.lower()
@@ -50,38 +34,14 @@ def parse_spanish_date(txt: str):
         return date(yy, mm, d)
     return None
 
-# del X al Y / del dd/mm/aaaa al dd/mm/aaaa
+DATE_PATTERNS = [
+    r"(?:fecha(?:\s+l[ií]mite)?(?:\s+de)?\s*(?:aplicaci[oó]n|postulaci[oó]n|cierre|presentaci[oó]n)?:?\s*)(\d{1,2}\s+de\s+\w+\s+\d{4})",
+    r"(?:cierran?\s+el\s+|cierra\s+el\s+|hasta el\s+)(\d{1,2}\s+de\s+\w+\s+\d{4})",
+    r"(\d{1,2}/\d{1,2}/\d{2,4})",
+]
 RANGE_PATTERNS = [
     r"del\s+(\d{1,2}\s+de\s+\w+\s+de\s+\d{4})\s+al\s+(\d{1,2}\s+de\s+\w+\s+de\s+\d{4})",
     r"del\s+(\d{1,2}/\d{1,2}/\d{2,4})\s+al\s+(\d{1,2}/\d{1,2}/\d{2,4})",
-]
-
-def extract_date_range(text: str):
-    if not text: return None, None
-    for pat in RANGE_PATTERNS:
-        m = re.search(pat, text, re.I)
-        if m:
-            s, e = parse_spanish_date(m.group(1)), parse_spanish_date(m.group(2))
-            return s, e
-    # "Inscripción: hasta el ... "
-    m = re.search(r"hasta\s+el\s+(\d{1,2}\s+de\s+\w+\s+\d{4})", text, re.I)
-    if m:
-        end = parse_spanish_date(m.group(1))
-        return None, end
-    m = re.search(r"hasta\s+(\d{1,2}/\d{1,2}/\d{2,4})", text, re.I)
-    if m:
-        end = parse_spanish_date(m.group(1))
-        return None, end
-    # fallback: single date in the text
-    end = extract_deadline(text)
-    return None, end
-
-DATE_PATTERNS = [
-    r"(?:fecha(?:\s+l[ií]mite)?(?:\s+de)?\s*(?:aplicaci[oó]n|postulaci[oó]n|cierre|presentaci[oó]n)?:?\s*)(\d{1,2}\s+de\s+\w+\s+\d{4})",
-    r"(?:cierran?\s+el\s+|cierra\s+el\s+)(\d{1,2}\s+de\s+\w+\s+\d{4})",
-    r"(?:hasta el\s*)(\d{1,2}\s+de\s+\w+\s+\d{4})",
-    r"(?:deadline:?|fecha l[ií]mite:?|cierre:?|cierra:?|cierran:?)[^\d]*(\d{1,2}\s+de\s+\w+\s+\d{4})",
-    r"(\d{1,2}/\d{1,2}/\d{2,4})",
 ]
 def extract_deadline(text: str):
     if not text: return None
@@ -91,15 +51,20 @@ def extract_deadline(text: str):
             d = parse_spanish_date(m.group(1))
             if d: return d
     return parse_spanish_date(text)
-
+def extract_date_range(text: str):
+    if not text: return None, None
+    for pat in RANGE_PATTERNS:
+        m = re.search(pat, text, re.I)
+        if m:
+            return parse_spanish_date(m.group(1)), parse_spanish_date(m.group(2))
+    end = extract_deadline(text)
+    return None, end
 def days_left(d):
     if not d: return None
     return (d - date.today()).days
 
-# ---------- Limpieza/heurísticas ----------
-def safe_text(el):
-    return re.sub(r"\s+", " ", (el.get_text(" ").strip() if el else "")).strip()
-
+# ---------- texto/heurísticas ----------
+def safe_text(el): return re.sub(r"\s+", " ", (el.get_text(" ").strip() if el else "")).strip()
 def type_guess(text: str):
     s = (text or "").lower()
     if "residenc" in s: return "residency"
@@ -107,14 +72,8 @@ def type_guess(text: str):
     if "premio" in s or "salón" in s or "salon" in s or "concurso" in s: return "prize"
     if "open call" in s or "convocatoria" in s: return "open_call"
     return "other"
-
-COUNTRIES = [
-    "argentina","uruguay","chile","mexico","méxico","españa","colombia","peru","perú",
-    "brasil","paraguay","bolivia","ecuador","costa rica","guatemala","panamá","panama",
-    "estados unidos","usa","reino unido","italia","francia","alemania","grecia","portugal"
-]
 CITIES_AR = ["caba","buenos aires","rosario","cordoba","córdoba","la plata","mendoza","tucumán","salta","neuquén","bahía blanca","bahia blanca"]
-
+COUNTRIES = ["argentina","uruguay","chile","mexico","méxico","españa","colombia","peru","perú","brasil","paraguay","bolivia","ecuador","costa rica","guatemala","panamá","panama","estados unidos","usa","reino unido","italia","francia","alemania","grecia","portugal"]
 def guess_location(text: str):
     s = (text or "").lower()
     for k in CITIES_AR:
@@ -127,11 +86,9 @@ def guess_location(text: str):
             return c.title()
     if "internacional" in s: return "Internacional"
     return "—"
-
 def scope_from_location(loc: str):
     if not loc or loc == "—": return "UNK"
-    return "AR" if loc.lower() == "argentina" else "EX"
-
+    return "AR" if loc.lower()=="argentina" else "EX"
 def extract_key_data(text: str):
     s = (text or "")
     m_amt = re.search(r"(USD|US\$|€|\$)\s?([\d\.\,]+)", s, re.I)
@@ -141,20 +98,8 @@ def extract_key_data(text: str):
     m_fee = re.search(r"(?:fee|arancel|inscripci[oó]n)\s*(?:de)?\s*(USD|US\$|€|\$)?\s*([\d\.\,]+)", s, re.I)
     fee = (m_fee.group(1) or "$") + " " + m_fee.group(2) if m_fee else "0"
     return prize, slots, fee
-
-def rec_tip(text: str):
-    s = (text or "").lower()
-    tips = []
-    if any(k in s for k in ["site-specific","arquitect","edificio","mural"]): tips.append("Site-specific / pintura expandida.")
-    if any(k in s for k in ["pintur","acrílico","óleo","temple"]): tips.append("Serie pictórica (6–10 obras).")
-    if any(k in s for k in ["digital","video","new media","web"]): tips.append("Obra digital / videoarte.")
-    if any(k in s for k in ["instalación","instalacion","escultura","3d"]): tips.append("Instalación con plan de montaje.")
-    if any(k in s for k in ["foto","fotograf","lens"]): tips.append("Ensayo fotográfico.")
-    if not tips: tips.append("Alineá con el texto curatorial; documentá proceso.")
-    return " • ".join(tips[:2])
-
-def difficulty_score(kind: str, text: str):
-    # Calculamos chance 0.02..0.45 (heurística) y devolvemos dificultad 1..100 (100 = más difícil)
+def difficulty_1_100(kind: str, text: str):
+    # menor chance => mayor dificultad
     base = 0.18
     t = (kind or "open_call").lower()
     s = (text or "").lower()
@@ -168,297 +113,216 @@ def difficulty_score(kind: str, text: str):
     if any(k in s for k in ["internacional","global","worldwide"]): base -= 0.05
     if any(k in s for k in ["argentina","caba","latinoamérica","latinoamerica"]): base += 0.02
     chance = max(0.02, min(0.45, base))
-    return max(1, min(100, 100 - round(chance * 100)))  # 100 = difícil
+    return max(1, min(100, 100 - round(chance * 100)))  # 100 = muy difícil
+def short_summary(text: str, max_len=260):
+    s = re.sub(r"\s+", " ", (text or "")).strip()
+    if len(s) <= max_len: return s
+    return s[:max_len-1] + "…"
 
-# ---------- Requests ----------
-def fetch(url: str, session: requests.Session = None):
-    s = session or requests
-    r = s.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+# ---------- HTTP ----------
+@st.cache_data(ttl=3600)
+def ddg_search(query: str, max_results=20):
+    """Usa el HTML simple de DuckDuckGo (sin JS). Devuelve lista de URLs limpias."""
+    url = "https://html.duckduckgo.com/html/?kl=es-es&q=" + urllib.parse.quote(query)
+    html = requests.get(url, headers=HEADERS, timeout=REQ_TIMEOUT).text
+    soup = BeautifulSoup(html, "html.parser")
+    urls = []
+    for a in soup.select("a"):
+        href = a.get("href") or ""
+        if not href: continue
+        # DDG envuelve con /l/?uddg=URL
+        if href.startswith("/l/?"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+            if "uddg" in qs:
+                href = qs["uddg"][0]
+        if href.startswith("http") and "duckduckgo" not in href:
+            urls.append(href)
+        if len(urls) >= max_results: break
+    return urls
+
+def fetch(url: str):
+    r = requests.get(url, headers=HEADERS, timeout=REQ_TIMEOUT, allow_redirects=True)
     r.raise_for_status()
     return r.text
 
-# ---------- Scrapers ----------
-def scrape_artealdia(url: str):
-    soup = BeautifulSoup(fetch(url), "html.parser")
-    out = []
-    for art in soup.select("article, .views-row, .node-teaser, .grid__item"):
-        a = art.select_one("h2 a, h3 a, a")
-        link = a.get("href") if a and a.has_attr("href") else url
-        if link.startswith("/"): link = urljoin(url, link)
-        title = safe_text(a) or "Convocatoria"
-        summary = safe_text(art)
-        s,e = extract_date_range(summary)
-        end = e or extract_deadline(summary)
-        out.append({
-            "source":"Arte Al Día","title":title,"url":link,
-            "open_at": s, "deadline": end, "type": type_guess(title+" "+summary),
-            "summary": summary[:800]
-        })
-    # dedupe
-    uniq, seen = [], set()
-    for r in out:
-        k=(r["title"], r["url"])
-        if k in seen: continue
-        seen.add(k); uniq.append(r)
-    return uniq[:50]
+# ---------- Parse de páginas ----------
+def extract_title_and_desc(soup: BeautifulSoup):
+    title = ""
+    for sel in ["meta[property='og:title']", "meta[name='twitter:title']"]:
+        m = soup.select_one(sel)
+        if m and m.get("content"): title = m["content"]; break
+    if not title:
+        h1 = soup.select_one("h1")
+        if h1: title = safe_text(h1)
+    if not title:
+        t = soup.select_one("title")
+        if t: title = safe_text(t)
+    desc = ""
+    for sel in ["meta[name='description']", "meta[property='og:description']"]:
+        m = soup.select_one(sel)
+        if m and m.get("content"): desc = m["content"]; break
+    if not desc:
+        p = soup.select_one("p")
+        if p: desc = safe_text(p)
+    return (title or "Convocatoria"), desc
 
-# --- Catálogos: parser por párrafos para sacar "Título" + "Inscripción" + links ---
-def parse_catalogos_blocks(full_text: str):
-    paras = [p.strip() for p in full_text.split("\n\n") if p.strip()]
-    items = []
-    for i, p in enumerate(paras):
-        if not re.search(r"inscripci[oó]n\s*:", p, re.I):
+def parse_page(url: str):
+    try:
+        html = fetch(url)
+    except Exception:
+        return None
+    soup = BeautifulSoup(html, "html.parser")
+    title, meta_desc = extract_title_and_desc(soup)
+    full_txt = safe_text(soup)
+    s, e = extract_date_range(full_txt)
+    end = e or extract_deadline(full_txt)
+    kind = type_guess(title + " " + meta_desc + " " + full_txt)
+    loc = guess_location(title + " " + full_txt)
+    scope = scope_from_location(loc)
+    prize, slots, fee = extract_key_data(full_txt)
+    diff = difficulty_1_100(kind, full_txt)
+    # armar resumen corto prioritizando meta_desc
+    snippet = short_summary(meta_desc if meta_desc else full_txt)
+    return {
+        "source": urlparse(url).netloc,
+        "title": title.strip(),
+        "url": url,
+        "open_at": s,
+        "deadline": end,
+        "type": kind,
+        "location": loc,
+        "scope": scope,
+        "difficulty": diff,
+        "prize": prize, "slots": slots, "fee": fee,
+        "summary": snippet,
+    }
+
+# ---------- Búsqueda agregada ----------
+SEARCH_QUERIES_AR = [
+    "convocatoria artes visuales argentina 2025",
+    "premio artes visuales argentina 2025",
+    "salón nacional artes visuales convocatoria 2025",
+    "residencia artistas argentina convocatoria 2025",
+    "open call arte argentina 2025",
+    "beca arte argentina 2025",
+    "premio klemm 2025 inscripción",
+    "salón tucumán artes visuales 2025 inscripción",
+    "concurso fotografía argentina convocatoria 2025",
+]
+SEARCH_QUERIES_EX = [
+    "open call visual arts 2025 residency",
+    "visual arts prize 2025 call",
+    "residency artist open call 2025",
+    "photography award 2025 open call",
+]
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def metasearch(only_ar: bool, max_pages: int = 40):
+    start = time.time()
+    urls = []
+    queries = (SEARCH_QUERIES_AR if only_ar else SEARCH_QUERIES_AR + SEARCH_QUERIES_EX)
+    for q in queries:
+        try:
+            urls += ddg_search(q, max_results=15 if only_ar else 10)
+        except Exception:
             continue
-        # título: buscar hacia arriba hasta encontrar una línea candidata
-        title = "Convocatoria"
-        for j in range(i-1, max(-1, i-4), -1):
-            cand = re.sub(r"\s+", " ", paras[j].strip())
-            if len(cand) < 4: continue
-            if re.search(r"^(suscribite|convocatorias|premios|los que ya pasaron)", cand, re.I): 
-                continue
-            if re.match(r"^https?://", cand, re.I): 
-                continue
-            title = cand.split("\n")[0][:120]
-            break
-        # rangos/fechas + links
-        s, e = extract_date_range(p)
-        joined = paras[i]
-        m_bases = re.search(r"bases\s*:\s*(https?://\S+)", joined, re.I)
-        m_form  = re.search(r"inscripci[oó]n\s*:\s*(https?://\S+)", joined, re.I)
-        items.append({
-            "title": title,
-            "open_at": s,
-            "deadline": e or extract_deadline(p),
-            "bases_url": m_bases.group(1) if m_bases else "",
-            "apply_url": m_form.group(1) if m_form else "",
-            "summary": (title + ". " + re.sub(r"\s+", " ", p))[:900],
-        })
+        if time.time() - start > TOTAL_HARD_LIMIT: break
+    # dedupe por URL base
+    seen = set(); unique = []
+    for u in urls:
+        base = u.split("#")[0]
+        if base in seen: continue
+        seen.add(base); unique.append(base)
+    # parsear páginas (capado)
+    items = []
+    for u in unique[:max_pages]:
+        if time.time() - start > TOTAL_HARD_LIMIT: break
+        rec = parse_page(u)
+        if rec:
+            items.append(rec)
     return items
 
-def scrape_catalogos(url: str):
-    soup = BeautifulSoup(fetch(url), "html.parser")
-    text = safe_text(soup)
-    blocks = parse_catalogos_blocks(text)
-    items = []
-    for b in blocks:
-        items.append({
-            "source": "Catálogos para Artistas",
-            "title": b["title"],
-            "url": b["apply_url"] or b["bases_url"] or url,
-            "open_at": b["open_at"],
-            "deadline": b["deadline"],
-            "type": type_guess(b["title"] + " " + b["summary"]),
-            "summary": b["summary"]
-        })
-    # fallback: anchors útiles
-    if not items:
-        for a in soup.select("a"):
-            t = safe_text(a)
-            if re.search(r"(premio|sal[oó]n|convocatoria|beca|residenc|concurso)", t, re.I):
-                items.append({
-                    "source":"Catálogos para Artistas",
-                    "title": t,
-                    "url": urljoin(url, a.get("href","")),
-                    "open_at": None, "deadline": None,
-                    "type": type_guess(t), "summary": t
-                })
-    uniq, seen = [], set()
-    for r in items:
-        k=(r["title"], r["url"])
-        if k in seen: continue
-        seen.add(k); uniq.append(r)
-    return uniq[:120]
-
-def scrape_bandadas(session: requests.Session):
-    out = []
-    email = st.secrets.get("BANDADAS_EMAIL")
-    password = st.secrets.get("BANDADAS_PASSWORD")
-    try:
-        if email and password:
-            # intento CSRF comunes
-            login_html = session.get(SOURCES["bandadas_login"], headers=HEADERS, timeout=REQUEST_TIMEOUT).text
-            soup = BeautifulSoup(login_html, "html.parser")
-            token_name, token_value = None, None
-            for name in ["authenticity_token","csrfmiddlewaretoken","_token","__RequestVerificationToken"]:
-                el = soup.find("input", {"name": name})
-                if el and el.get("value"): token_name, token_value = name, el.get("value"); break
-            payload = {"email": email, "password": password}
-            if token_name: payload[token_name] = token_value
-            session.post(SOURCES["bandadas_login"], data=payload, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-
-        html = fetch(SOURCES["bandadas_convoc"], session=session)
-        soup = BeautifulSoup(html, "html.parser")
-        for card in soup.select("article, .card, .convocation, .convocatoria, li"):
-            txt = safe_text(card)
-            if not re.search(r"(convocatoria|residenc|premio|sal[oó]n|beca|open call|concurso)", txt, re.I):
-                continue
-            a = card.select_one("a")
-            link = (a.get("href") if a and a.has_attr("href") else SOURCES["bandadas_convoc"])
-            if link.startswith("/"): link = urljoin(SOURCES["bandadas_convoc"], link)
-            title = safe_text(a) or txt.split(".")[0][:80]
-            s, e = extract_date_range(txt)
-            out.append({
-                "source":"Bandadas","title":title,"url":link,"open_at":s,"deadline":e or extract_deadline(txt),
-                "type": type_guess(txt),"summary": txt[:800]
-            })
-    except Exception:
-        st.info("Bandadas: no pude leer listados (posible cambio de login/HTML). Probá con otras fuentes o revisemos el selector.")
-    uniq, seen = [], set()
-    for r in out:
-        k=(r["title"], r["url"])
-        if k in seen: continue
-        seen.add(k); uniq.append(r)
-    return uniq[:60]
-
-def gather(enabled: dict):
-    start = time.time()
-    out=[]
-    if enabled.get("artealdia"):
-        try:
-            for k in ["artealdia_main","artealdia_tag_convocatorias","artealdia_tag_convocatoria"]:
-                out += scrape_artealdia(SOURCES[k])
-        except Exception as e:
-            st.warning(f"Arte Al Día off: {e}")
-    if time.time() - start > TOTAL_HARD_LIMIT: return out
-
-    if enabled.get("catalogos"):
-        try:
-            out += scrape_catalogos(SOURCES["catalogos_convocatorias"])
-        except Exception as e:
-            st.warning(f"Catálogos off: {e}")
-    if time.time() - start > TOTAL_HARD_LIMIT: return out
-
-    if enabled.get("bandadas"):
-        try:
-            with requests.Session() as s:
-                out += scrape_bandadas(s)
-        except Exception:
-            st.info("Bandadas requiere login/HTML estable. Si tarda, desactívala.")
-    return out
-
 # ---------- UI ----------
-st.title("🎨 Artify — Convocatorias (ordenadas por fecha)")
+st.title("🎨 Artify — Convocatorias (metabúsqueda web)")
 with st.sidebar:
-    st.header("Fuentes")
-    enabled = {
-        "artealdia": st.checkbox("Arte Al Día", True),
-        "catalogos": st.checkbox("Catálogos para Artistas", True),
-        "bandadas": st.checkbox("Bandadas (usar st.secrets)", False),
-    }
-    st.header("Filtros")
+    st.header("Opciones")
+    ámbito = st.radio("Ámbito", ["Todas", "AR solo", "Fuera de AR"], horizontal=True, index=0)
     solo_futuras = st.checkbox("Solo futuras", True)
     year_to_show = st.number_input("Año hasta", value=YEAR, step=1)
-    q = st.text_input("Buscar (título/descripcion)", "")
-    type_filter = st.multiselect("Tipo", ["open_call","grant","prize","residency","other"], default=["open_call","grant","prize","residency"])
-    ámbito = st.radio("Ámbito", ["Todas", "AR solo", "Fuera de AR"], horizontal=True)
-    st.caption("Tip: si tarda, apagá Bandadas y reintentá.")
+    q = st.text_input("Buscar texto", "")
+    type_filter = st.multiselect("Tipo", ["open_call","grant","prize","residency","other"],
+                                 default=["open_call","grant","prize","residency"])
+    top_n = st.slider("Páginas a inspeccionar", 20, 120, 50, 10)
+    st.caption("Tip: subí el número para encontrar más. El tope balancea velocidad vs. cobertura.")
 
-if st.button("🔎 Cargar convocatorias", type="primary"):
-    calls = gather(enabled)
+if st.button("🔎 Buscar convocatorias", type="primary"):
+    only_ar = (ámbito == "AR solo")
+    items = metasearch(only_ar, max_pages=top_n)
 
-    # Enriquecer
-    enriched=[]
-    for c in calls:
-        text = (c.get("title","")+" "+c.get("summary",""))
-        prize, slots, fee = extract_key_data(text)
-        loc = guess_location(text)
-        scope = scope_from_location(loc)
-        diff = difficulty_score(c.get("type"), text)
-        enriched.append({
-            **c, "location":loc, "scope":scope,
-            "prize":prize, "slots":slots, "fee":fee,
-            "difficulty": diff, "tip": rec_tip(c.get("summary","")),
-            "days_left": days_left(c.get("deadline")),
-        })
-
-    # Filtros
-    end_limit = date(year_to_show, 12, 31)
+    # filtros finos
     def keep(x):
         d = x.get("deadline")
-        if solo_futuras and d and d < date.today(): return False
-        if d and d > end_limit: return False
-        if type_filter and x.get("type") not in type_filter: return False
-        if ámbito == "AR solo" and x.get("scope") != "AR": return False
         if ámbito == "Fuera de AR" and x.get("scope") == "AR": return False
+        if ámbito == "AR solo" and x.get("scope") != "AR": return False
+        if solo_futuras and d and d < date.today(): return False
+        if d and d > date(year_to_show,12,31): return False
+        if type_filter and x.get("type") not in type_filter: return False
         if q:
             s = (x.get("title","")+" "+x.get("summary","")).lower()
             if q.lower() not in s: return False
         return True
-    items = [x for x in enriched if keep(x)]
+    results = [x for x in items if keep(x)]
 
-    # Orden por fecha (None al final)
-    items.sort(key=lambda r: (r.get("deadline") is None, r.get("deadline") or date(year_to_show,12,31)))
+    # ordenar: fecha (None al final)
+    results.sort(key=lambda r: (r.get("deadline") is None, r.get("deadline") or date(year_to_show,12,31)))
 
-    # Resumen
-    total = len(items)
-    first_dl = next((it["deadline"] for it in items if it.get("deadline")), None)
-    last_dl  = next((it["deadline"] for it in reversed(items) if it.get("deadline")), None)
+    # resumen superior
     c1,c2,c3 = st.columns(3)
-    c1.metric("Convocatorias", total)
-    c2.metric("Primera fecha", first_dl.strftime("%d/%m/%Y") if first_dl else "—")
-    c3.metric("Última fecha",  last_dl.strftime("%d/%m/%Y")  if last_dl  else "—")
+    c1.metric("Resultados", len(results))
+    first = next((it["deadline"] for it in results if it.get("deadline")), None)
+    last  = next((it["deadline"] for it in reversed(results) if it.get("deadline")), None)
+    c2.metric("Primera fecha", first.strftime("%d/%m/%Y") if first else "—")
+    c3.metric("Última fecha",  last.strftime("%d/%m/%Y")  if last  else "—")
     st.markdown("---")
 
-    # Tarjetas
-    for it in items:
-        open_at = it.get("open_at")
-        open_txt = open_at.strftime("%d/%m/%Y") if open_at else "—"
-        dl = it.get("deadline")
+    # tarjetas
+    if not results:
+        st.warning("No encontré resultados con esos filtros. Probá aumentar 'Páginas a inspeccionar' o quitar 'Solo futuras'.")
+    for r in results:
+        open_txt = r["open_at"].strftime("%d/%m/%Y") if r.get("open_at") else "—"
+        dl = r.get("deadline")
         dl_txt = dl.strftime("%d/%m/%Y") if dl else "Sin dato"
-        left_days = it.get("days_left")
-        urgency = "🟢" if left_days is None else ("🟡" if left_days and left_days <= 21 else "🟢")
-        if left_days is not None and left_days <= 7: urgency = "🔴"
+        left = days_left(dl)
+        urgency = "🟢" if left is None else ("🟡" if left and left <= 21 else "🟢")
+        if left is not None and left <= 7: urgency = "🔴"
 
         with st.container(border=True):
             a,b = st.columns([3,1])
             with a:
-                st.subheader(it["title"])
-                st.markdown(f"[Abrir convocatoria]({it['url']})")
-                st.markdown(f"**Fuente:** {it['source']}  •  **Tipo:** `{it['type']}`  •  **Lugar:** {it['location']}")
-                st.markdown(f"**Abre:** {open_txt}  •  **Cierra:** {dl_txt} {('(' + str(left_days) + ' días)') if left_days is not None else ''}  {urgency}")
-                if it.get("summary"):
-                    st.write(it["summary"][:700] + ("…" if len(it["summary"])>700 else ""))
+                st.subheader(r["title"])
+                st.markdown(f"[Abrir convocatoria]({r['url']})")
+                st.markdown(f"**Fuente:** {r['source']}  •  **Tipo:** `{r['type']}`  •  **Lugar:** {r['location']}")
+                st.markdown(f"**Abre:** {open_txt}  •  **Cierra:** {dl_txt} {('(' + str(left) + ' días)') if left is not None else ''}  {urgency}")
+                st.write(r["summary"])
             with b:
-                st.metric("Dificultad (1–100)", it["difficulty"])
+                st.metric("Dificultad (1–100)", r["difficulty"])
                 st.caption("Datos clave")
-                st.write(f"• **Premio:** {it['prize']}")
-                st.write(f"• **Cupos:** {it['slots']}")
-                st.write(f"• **Fee:** {it['fee']}")
-                st.caption("Tip de obra")
-                st.write("• " + it["tip"])
+                st.write(f"• **Premio:** {r['prize']}")
+                st.write(f"• **Cupos:** {r['slots']}")
+                st.write(f"• **Fee:** {r['fee']}")
 
-    # Export
-    if items:
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(["title","source","type","location","scope","open_at","deadline","url","prize","slots","fee","difficulty","summary"])
-        for c in items:
+    # export
+    if results:
+        buf = io.StringIO(); w = csv.writer(buf)
+        w.writerow(["title","url","source","type","location","scope","open_at","deadline","difficulty","prize","slots","fee","summary"])
+        for c in results:
             w.writerow([
-                c["title"], c["source"], c["type"], c["location"], c["scope"],
+                c["title"], c["url"], c["source"], c["type"], c["location"], c["scope"],
                 c["open_at"].strftime("%Y-%m-%d") if c.get("open_at") else "",
                 c["deadline"].strftime("%Y-%m-%d") if c.get("deadline") else "",
-                c["url"], c["prize"], c["slots"], c["fee"], c["difficulty"], c.get("summary","")
+                c["difficulty"], c["prize"], c["slots"], c["fee"], c["summary"]
             ])
-        st.download_button("⬇️ Exportar CSV", buf.getvalue(), "artify_convocatorias.csv", "text/csv")
-
-        def make_ics(items):
-            def dtfmt(d): return d.strftime("%Y%m%d")
-            ics = ["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//Artify//Convocatorias//ES"]
-            for c in items:
-                if not c.get("deadline"): continue
-                desc = (c.get("summary","")[:200]).replace("\n"," ")
-                ics += [
-                    "BEGIN:VEVENT",
-                    f"SUMMARY:{c['title']} (cierra)",
-                    f"DTSTART;VALUE=DATE:{dtfmt(c['deadline'])}",
-                    f"DTEND;VALUE=DATE:{dtfmt(c['deadline'] + timedelta(days=1))}",
-                    f"DESCRIPTION:{desc}  URL: {c.get('url','')}",
-                    "END:VEVENT"
-                ]
-            ics.append("END:VCALENDAR")
-            return "\n".join(ics)
-        st.download_button("📅 Exportar calendario (ICS)", make_ics(items), "artify_convocatorias.ics", "text/calendar")
-
+        st.download_button("⬇️ Exportar CSV", buf.getvalue(), "artify_websearch.csv", "text/csv")
 else:
-    st.info("Elegí las fuentes y tocá **“🔎 Cargar convocatorias”**. Mostramos por fecha hasta el "
-            f"**{date(YEAR,12,31).strftime('%d/%m/%Y')}**.")
+    st.info("Elegí ‘Ámbito’, ajustá ‘Páginas a inspeccionar’ y tocá **‘🔎 Buscar convocatorias’**. "
+            "La app rastrea la web (DDG) y ordena por fecha. Subí el tope para conseguir 20+ resultados.")
