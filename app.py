@@ -1,7 +1,7 @@
 # ✨ Artify — buscador de convocatorias de arte para Fla ❤️
-# Modo AR curado: sin buscadores, crawl dirigido en sitios argentinos + “IA” liviana en español.
+# Motor AR curado: crawl dirigido en sitios argentinos + “IA” liviana en español + enlaces inteligentes.
 
-import re, io, csv, time
+import re, io, csv, time, socket
 from datetime import date, timedelta
 from urllib.parse import urlparse, urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,7 +10,9 @@ import requests
 from bs4 import BeautifulSoup
 import streamlit as st
 
-# ────────────────── Config / UI ──────────────────
+# ────────────────────────────────────────────────────────────────────────────────
+# Config / Título
+# ────────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Artify — buscador de convocatorias de arte para Fla ❤️",
     layout="wide"
@@ -18,6 +20,9 @@ st.set_page_config(
 st.title("✨ Artify — buscador de convocatorias de arte para Fla ❤️")
 st.caption("Motor argentino curado. Resultados en español con título y reseña automática, dificultad (1–100) y export a CSV/ICS.")
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Constantes
+# ────────────────────────────────────────────────────────────────────────────────
 YEAR = date.today().year
 MAX_WORKERS = 12
 REQ_TIMEOUT = 8
@@ -46,7 +51,97 @@ SKIP_HOSTS = (
 )
 SKIP_EXTS = (".pdf",".jpg",".jpeg",".png",".gif",".webp",".doc",".docx",".xls",".xlsx",".zip",".rar")
 
-# ────────────────── Fecha (robusta) ──────────────────
+# ────────────────────────────────────────────────────────────────────────────────
+# Utilidades de red / links (enlaces inteligentes)
+# ────────────────────────────────────────────────────────────────────────────────
+def normalize_url(u: str, base: str):
+    if not u: return None
+    u = u.strip()
+    if u.startswith("//"): u = "https:" + u
+    if u.startswith("/"):  u = urljoin(base, u)
+    if not re.match(r"^https?://", u): return None
+    return u.split("#")[0]
+
+def head_ok(u: str, timeout=7):
+    """HEAD/GET cortos para validar que el link exista; sigue redirecciones."""
+    if not u: return False
+    try:
+        r = requests.head(u, headers=HEADERS, timeout=timeout, allow_redirects=True)
+        if r.status_code in (405, 403):  # algunos sitios bloquean HEAD
+            r = requests.get(u, headers=HEADERS, timeout=timeout, allow_redirects=True, stream=True)
+        return 200 <= r.status_code < 400
+    except (requests.RequestException, socket.error):
+        return False
+
+def best_links(soup: BeautifulSoup, base_url: str):
+    """Encuentra enlaces relevantes: Inscripción / Bases / Principal / PDFs."""
+    links = {"principal": None, "bases": None, "inscripcion": None, "pdfs": []}
+
+    # 1) og:url / canonical como 'principal'
+    og = soup.select_one("meta[property='og:url']")
+    if og and og.get("content"):
+        links["principal"] = normalize_url(og["content"], base_url)
+    if not links["principal"]:
+        can = soup.select_one("link[rel='canonical']")
+        if can and can.get("href"):
+            links["principal"] = normalize_url(can["href"], base_url)
+
+    # 2) anclas del documento
+    candidates = []
+    for a in soup.select("a[href]"):
+        text = (a.get_text(" ") or "").strip().lower()
+        href = normalize_url(a["href"], base_url)
+        if not href:
+            continue
+        candidates.append((text, href))
+        if href.lower().endswith(".pdf"):
+            links["pdfs"].append(href)
+
+    def pick(patterns, avoid_pdf=True):
+        for txt, href in candidates:
+            if avoid_pdf and href.lower().endswith(".pdf"):
+                continue
+            if any(p in txt for p in patterns):
+                return href
+        return None
+
+    # Inscripción / Postular
+    links["inscripcion"] = pick(["inscrip", "postul", "apply", "registro", "formulario", "aplicar"])
+    # Bases / Reglamento
+    links["bases"] = pick(["base", "reglamento", "condicion", "término", "terms", "rules"], avoid_pdf=False)
+
+    # 3) Fallback de principal: primer link que no sea nav y no sea ancla interna
+    if not links["principal"]:
+        for txt, href in candidates:
+            if href and not href.endswith("#"):
+                links["principal"] = href
+                break
+
+    # Validación rápida
+    for k in ["inscripcion", "bases", "principal"]:
+        if links[k] and not head_ok(links[k], timeout=5):
+            links[k] = None
+
+    # Si bases no está pero hay un PDF, usamos el primero válido
+    if not links["bases"]:
+        for p in links["pdfs"]:
+            if head_ok(p, timeout=5):
+                links["bases"] = p
+                break
+
+    return links
+
+def link_button(label: str, url: str):
+    """Botón de enlace compatible (si no existe st.link_button en tu versión)."""
+    if not url: return
+    try:
+        st.link_button(label, url)
+    except Exception:
+        st.markdown(f"[{label}]({url})")
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Fechas (robusto y en español)
+# ────────────────────────────────────────────────────────────────────────────────
 MONTHS = {'enero':1,'febrero':2,'marzo':3,'abril':4,'mayo':5,'junio':6,
           'julio':7,'agosto':8,'septiembre':9,'setiembre':9,'octubre':10,'noviembre':11,'diciembre':12}
 def _mk_date(y, m, d):
@@ -105,7 +200,9 @@ def extract_range(text: str):
     return (None, extract_deadline(s))
 def days_left(d): return None if not d else (d - date.today()).days
 
-# ────────────────── IA liviana (título+resumen en ES) ──────────────────
+# ────────────────────────────────────────────────────────────────────────────────
+# “IA” liviana en local (ES): título + resumen
+# ────────────────────────────────────────────────────────────────────────────────
 KEYWORDS = ["convocatoria","premio","salón","salon","residenc","beca","open call","inscripción","cierre","bases"]
 def sentences(text:str): return [s.strip() for s in re.split(r"(?<=[\.\!\?])\s+", text) if s.strip()]
 def resumen_ia(text:str, n=3, max_chars=360):
@@ -130,7 +227,9 @@ def titulo_ia(title:str, text:str, domain:str):
         return pro[:140].title()
     return f"Convocatoria ({domain.replace('www.','')})"
 
-# ────────────────── HTTP / Parse ──────────────────
+# ────────────────────────────────────────────────────────────────────────────────
+# HTTP / Parse
+# ────────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=21600, show_spinner=False)
 def fetch(url:str):
     r=requests.get(url, headers=HEADERS, timeout=REQ_TIMEOUT, allow_redirects=True)
@@ -218,6 +317,7 @@ def parse_page(url:str):
         titulo = titulo_ia(raw_title, full, urlparse(url).netloc)
         resumen = resumen_ia(meta_desc if meta_desc else full)
         diff = dificultad_1_100(tipo, full)
+        links = best_links(soup, url)
         return {
             "source": urlparse(url).netloc.replace("www.",""),
             "title": titulo, "url": url,
@@ -225,11 +325,14 @@ def parse_page(url:str):
             "type": tipo, "location": loc, "scope": scope_from_location(loc),
             "difficulty": diff, "prize": premio, "slots": cupos, "fee": fee,
             "summary": resumen,
+            "links": links,
         }
     except Exception:
         return None
 
-# ────────────────── Crawl AR curado ──────────────────
+# ────────────────────────────────────────────────────────────────────────────────
+# Crawl AR curado (BFS cortito por sitio)
+# ────────────────────────────────────────────────────────────────────────────────
 def seems_call(url:str, text:str):
     u=url.lower()
     if any(k in u for k in ("/convocatoria","/convocatorias","/premio","/residenc","/salon","/salón","/beca")):
@@ -239,7 +342,7 @@ def seems_call(url:str, text:str):
 
 @st.cache_data(ttl=7200, show_spinner=False)
 def crawl_site_for_calls(seed:str, per_site_limit:int=12):
-    """BFS cortito dentro del dominio: junta URLs que parecen convocatoria."""
+    """BFS corto dentro del dominio: junta URLs que parecen convocatoria."""
     host = urlparse(seed).netloc
     visited=set(); queue=[seed]; found=[]
     while queue and len(visited) < per_site_limit:
@@ -292,7 +395,9 @@ def gather_curated_ar(total_limit:int):
         if len(clean) >= total_limit: break
     return clean
 
-# ────────────────── Filtros UI ──────────────────
+# ────────────────────────────────────────────────────────────────────────────────
+# Filtros UI
+# ────────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Filtros")
     ámbito = st.radio("Ámbito", ["AR (curado)","Todas (curado)"], horizontal=True, index=0)
@@ -304,12 +409,14 @@ with st.sidebar:
     total_pages = st.slider("Intensidad de búsqueda (páginas aprox.)", 24, 96, 60, 12)
     st.caption("El motor recorre sitios argentinos clave. 48–72 suele traer 10–40 convocatorias reales.")
 
-# ────────────────── Run ──────────────────
+# ────────────────────────────────────────────────────────────────────────────────
+# Run
+# ────────────────────────────────────────────────────────────────────────────────
 if st.button("🔎 Buscar convocatorias", type="primary"):
     t0=time.time()
     items=[]
 
-    urls = gather_curated_ar(total_pages if ámbito=="AR (curado)" else total_pages)
+    urls = gather_curated_ar(total_pages)
     results=[]; done=0; prog=st.progress(0)
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futs=[ex.submit(parse_page,u) for u in urls]
@@ -363,7 +470,7 @@ if st.button("🔎 Buscar convocatorias", type="primary"):
             a,b=st.columns([3,1])
             with a:
                 st.subheader(r["title"])
-                st.markdown(f"[Abrir convocatoria]({r['url']})")
+                # chips informativos
                 st.markdown(f"`{r['type']}` · {r['location']} · {r['source']}")
                 st.markdown(f"**Abre:** {open_txt} • **Cierra:** {dl_txt} {f'({left} días)' if left is not None else ''} {urgency}")
                 st.write(r["summary"])
@@ -373,6 +480,14 @@ if st.button("🔎 Buscar convocatorias", type="primary"):
                 st.write(f"• **Premio:** {r['prize']}")
                 st.write(f"• **Cupos:** {r['slots']}")
                 st.write(f"• **Fee:** {r['fee']}")
+                st.divider()
+                # Enlaces inteligentes (validados)
+                links = r.get("links", {})
+                if links.get("inscripcion"):
+                    link_button("📝 Postular / Inscripción", links["inscripcion"])
+                if links.get("bases"):
+                    link_button("📄 Bases / Reglamento", links["bases"])
+                link_button("🌐 Abrir publicación", links.get("principal") or r["url"])
 
     # export
     if items:
