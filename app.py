@@ -1,6 +1,7 @@
 # ✨ Artify — buscador de convocatorias de arte para Fla ❤️
-# UI estilo “Hércules” + motor AR curado + PARSERS dedicados
-# FIX: detección PDF/binario, sanitización de texto, y títulos inteligentes.
+# Motor AR curado + parsers dedicados. SIN "dificultad".
+# Fix: detección PDF/binario + sanitización de texto + títulos inteligentes.
+# Cobertura ampliada (más páginas por sitio y tope global mayor).
 
 import re, io, csv, time, socket
 from datetime import date, timedelta
@@ -35,15 +36,17 @@ hr.sep{border:none;border-top:1px solid #eee;margin:8px 0 16px}
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="topbar"><h1>✨ Artify — buscador de convocatorias de arte para Fla ❤️</h1></div>', unsafe_allow_html=True)
-st.caption("Resultados en español, con resumen automático y dificultad (1–100). Motor curado para Argentina con parsers dedicados y manejo de PDFs.")
+st.caption("Motor curado para Argentina con parsers dedicados. Maneja PDFs, limpia texto y genera títulos/resúmenes en español.")
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Constantes / Seeds
 # ────────────────────────────────────────────────────────────────────────────────
-YEAR = date.today().year
-MAX_WORKERS = 12
-REQ_TIMEOUT = 9
-HARD_TIME_LIMIT = 30
+MAX_WORKERS   = 14
+REQ_TIMEOUT   = 9
+HARD_TIME_LIMIT = 45       # más margen para recorrer
+TOTAL_LIMIT   = 120        # más URLs en total
+PER_SITE_PAGES= 24         # más páginas por dominio
+
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 CURATED_AR_SEEDS = [
@@ -69,7 +72,7 @@ SKIP_HOSTS = (
 SKIP_EXTS = (".jpg",".jpeg",".png",".gif",".webp",".doc",".docx",".xls",".xlsx",".zip",".rar")
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Utilidades: red / binarios / links
+# Utilidades de red / binarios / links
 # ────────────────────────────────────────────────────────────────────────────────
 def normalize_url(u: str, base: str):
     if not u: return None
@@ -101,9 +104,7 @@ def is_pdf(data:bytes, ct:str):
     return data[:4] == b"%PDF"
 
 def bytes_to_html(data:bytes, ct:str):
-    """Devuelve (html_str o '', encoding_usado). Evita romperse con binarios."""
     if is_pdf(data, ct): return "", None
-    # requests ya intenta detectar encoding, pero por las dudas:
     try:
         return data.decode("utf-8"), "utf-8"
     except UnicodeDecodeError:
@@ -114,7 +115,6 @@ def bytes_to_html(data:bytes, ct:str):
 
 def cleanup_text(s:str):
     if not s: return ""
-    # quitar nulls y caracteres de control raros
     s = s.replace("\x00"," ")
     s = re.sub(r"[\uFFFD]{2,}", " ", s)  # � repetidos
     s = re.sub(r"[^\x09\x0A\x0D\x20-\x7E\u00A0-\uFFFF]", " ", s)
@@ -124,9 +124,8 @@ def cleanup_text(s:str):
 def looks_gibberish(s:str):
     if not s: return False
     if s.count("�") >= 5: return True
-    # proporción de “no letras ni signos básicos”
     junk = len(re.findall(r"[^0-9A-Za-zÁÉÍÓÚáéíóúÑñÜü¿?¡!;:.,()\\[\\]{}/\\-–—%€$\\s]", s))
-    return junk > 0.35*max(1,len(s))  # heurística
+    return junk > 0.35*max(1,len(s))
 
 def best_links(soup: BeautifulSoup, base_url: str):
     links={"principal":None,"bases":None,"inscripcion":None,"pdfs":[]}
@@ -226,34 +225,28 @@ def days_left(d): return None if not d else (d - date.today()).days
 KEYWORDS=["convocatoria","premio","salón","salon","residenc","beca","open call","inscripción","cierre","bases"]
 
 def smart_title_guess(title:str, text:str, domain:str):
-    """Mejor heurística: partir y elegir el fragmento más “arte/convocatoria”."""
     raw = (title or "").strip()
     if raw and not re.fullmatch(r"(convocatoria|home|inicio|noticias?)", raw, re.I):
         base = raw
     else:
         base = ""
-    # Cortes comunes
     parts = re.split(r"\s*[|\-—–·]\s*", base) if base else []
     if not parts:
-        # intentar del cuerpo
         m=re.search(r"(premio|sal[oó]n|residenc\w+|beca|open call|convocatoria)[^\.]{0,80}", (text or ""), re.I)
-        if m:
-            parts=[m.group(0)]
+        if m: parts=[m.group(0)]
     if not parts:
         return f"Convocatoria ({domain.replace('www.','')})"
-    # Puntuamos por palabras clave
     best=None; score_best=-1
     for p in parts:
         s=0
         s+=sum(k in p.lower() for k in ["premio","salón","salon","residenc","beca","convocatoria","open call"])
         s+=len(re.findall(r"20\d{2}", p))
         if s>score_best: score_best=s; best=p
-    # Titlecase amable (no rompe siglas cortas)
     def friendly_tc(x):
         words=x.split()
         out=[]
         for w in words:
-            if len(w)<=3 and w.isupper(): out.append(w)       # siglas
+            if len(w)<=3 and w.isupper(): out.append(w)
             elif w.lower() in {"de","del","la","las","los","y","en","a","al","para"}: out.append(w.lower())
             else: out.append(w[:1].upper()+w[1:].lower())
         return " ".join(out)
@@ -276,55 +269,6 @@ def resumen_ia(text:str,n=3,max_chars=360):
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Parse genérico (maneja PDF/binario)
-# ────────────────────────────────────────────────────────────────────────────────
-def parse_generic(url:str):
-    try:
-        data, ct, final = fetch_bytes(url)
-        html, enc = bytes_to_html(data, ct)
-
-        if not html:
-            # Es PDF / binario → tarjeta mínima y botón de Bases
-            domain=urlparse(final).netloc.replace("www.","")
-            fname = final.split("/")[-1]
-            title = smart_title_guess(fname, "", domain)
-            return {
-                "source": domain,
-                "title": title if title else f"Documento PDF — {domain}",
-                "url": final,
-                "open_at": None, "deadline": None,
-                "type": "Convocatorias", "location":"—","scope":"UNK",
-                "difficulty": 70, "prize":"—","slots":"—","fee":"0","free":True,
-                "summary": "Documento PDF de bases / reglamento. Abrí el enlace para ver condiciones y fechas.",
-                "links": {"principal": final, "bases": final, "inscripcion": None, "pdfs":[final]},
-            }
-
-        soup=BeautifulSoup(html, "html.parser")
-        raw_title, meta_desc = extract_title_desc(soup)
-        full = cleanup_text(soup.get_text(" "))
-        if looks_gibberish(full): full = meta_desc  # fallback
-
-        abre, cierra = extract_range(full)
-        tipo = type_guess(raw_title+" "+meta_desc+" "+full)
-        loc  = guess_location(raw_title+" "+full)
-        premio, cupos, fee = extract_key_data(full)
-        titulo = smart_title_guess(raw_title, full, urlparse(final).netloc)
-        resumen = resumen_ia(meta_desc if meta_desc else full)
-        diff = dificultad_1_100(tipo.lower(), full)
-        links = best_links(soup, final)
-        free = bool(re.search(r"(sin costo|sin cargo|gratuit[oa]|gratis)", full.lower()))
-        return {
-            "source": urlparse(final).netloc.replace("www.",""),
-            "title": titulo, "url": final,
-            "open_at": abre, "deadline": cierra,
-            "type": tipo, "location": loc, "scope": scope_from_location(loc),
-            "difficulty": diff, "prize": premio, "slots": cupos, "fee": fee,
-            "free": free, "summary": resumen, "links": links
-        }
-    except Exception:
-        return None
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Clasificación/ubicación/datos clave
 # ────────────────────────────────────────────────────────────────────────────────
 def extract_title_desc(soup:BeautifulSoup):
     title=""
@@ -370,352 +314,20 @@ def extract_key_data(text:str):
     premio=f"{m_amt.group(1).upper()} {m_amt.group(2)}" if m_amt else "—"
     m_slots=re.search(r"(\d+)\s+(cupos|ganadores|becas|finalistas)", s, re.I)
     cupos=m_slots.group(1) if m_slots else "—"
-    m_fee=re.search(r"(?:fee|arancel|inscripci[oó]n)\s*(?:de)?\s*(USD|US\$|€|\$)?\s*([\d\.\,]+)", s, re.I)
+    m_fee=re.search(r"(?:fee|arancel|inscripci[oó]n)\s*(?:de)?\s*(USD|US\$|€)?\s*([\d\.\,]+)", s, re.I)
     fee=(m_fee.group(1) or "$")+" "+m_fee.group(2) if m_fee else "0"
     return premio, cupos, fee
 
-def dificultad_1_100(tipo:str, text:str):
-    base=0.18
-    t=(tipo or "").lower(); s=(text or "").lower()
-    if t=="concursos": base-=0.06
-    if t=="becas": base+=0.04
-    if t=="residencias": base-=0.02
-    if "usd" in s or "$" in s or "€" in s: base-=0.03
-    m=re.search(r"(\d+)\s+(cupos|ganadores|becas|finalistas)", s)
-    if m: base += min(0.10, int(m.group(1))*0.01)
-    if any(k in s for k in ["internacional","global"]): base-=0.05
-    if "argentina" in s: base+=0.02
-    chance=max(0.02, min(0.45, base))
-    return max(1, min(100, 100 - round(chance*100)))
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Parsers dedicados (corrigen títulos/links)
-# ────────────────────────────────────────────────────────────────────────────────
-def parse_klemm(url:str):
-    rec = parse_generic(url)
-    if not rec: return None
+def parse_generic(url:str):
     try:
         data, ct, final = fetch_bytes(url)
         html, enc = bytes_to_html(data, ct)
-        if html:
-            soup=BeautifulSoup(html,"html.parser")
-            full=cleanup_text(soup.get_text(" "))
-            if "premio" in full.lower() and "klemm" in full.lower():
-                rec["type"]="Concursos"
-                if "klemm" not in rec["title"].lower():
-                    rec["title"]=smart_title_guess("Premio Klemm", full, urlparse(final).netloc)
-            # links
-            for a in soup.select("a[href]"):
-                href=normalize_url(a["href"], final) or ""
-                tx=(a.get_text(" ") or "").lower()
-                if "inscrip" in tx or "postul" in tx or "premioklemm" in href:
-                    rec["links"]["inscripcion"]=href
-                if "base" in tx or href.lower().endswith(".pdf"):
-                    rec["links"]["bases"]=href
-    except Exception: pass
-    return rec
 
-def parse_fna(url:str):
-    rec = parse_generic(url);  # tipo/links luego
-    if not rec: return None
-    try:
-        data, ct, final = fetch_bytes(url)
-        html, enc = bytes_to_html(data, ct)
-        if html:
-            soup=BeautifulSoup(html,"html.parser"); full=cleanup_text(soup.get_text(" "))
-            if "beca" in full.lower(): rec["type"]="Becas"
-            dl=extract_deadline(full);  rec["deadline"]=dl or rec["deadline"]
-            for a in soup.select("a[href]"):
-                href=normalize_url(a["href"], final) or ""; tx=(a.get_text(" ") or "").lower()
-                if any(k in tx for k in ["inscrip","postul","formulario","aplicar"]) or "forms.gle" in href:
-                    rec["links"]["inscripcion"]=href
-                if "base" in tx or "reglamento" in tx:
-                    rec["links"]["bases"]=href
-            if "fondo nacional de las artes" not in rec["title"].lower():
-                rec["title"]="FNA — " + rec["title"]
-    except Exception: pass
-    return rec
-
-def parse_palais(url:str):
-    rec = parse_generic(url)
-    if not rec: return None
-    try:
-        data, ct, final = fetch_bytes(url)
-        html, enc = bytes_to_html(data, ct)
-        if html:
-            soup=BeautifulSoup(html,"html.parser"); full=cleanup_text(soup.get_text(" "))
-            if "salón nacional" in full.lower() or "salon nacional" in full.lower():
-                rec["type"]="Concursos"
-                if "salón nacional" not in rec["title"].lower():
-                    rec["title"]="Salón Nacional — " + rec["title"]
-            dl=extract_deadline(full); rec["deadline"]=dl or rec["deadline"]
-            for a in soup.select("a[href]"):
-                href=normalize_url(a["href"], final) or ""; tx=(a.get_text(" ") or "").lower()
-                if "inscrip" in tx or "postul" in tx: rec["links"]["inscripcion"]=href
-                if "base" in tx or "reglamento" in tx or href.lower().endswith(".pdf"): rec["links"]["bases"]=href
-    except Exception: pass
-    return rec
-
-def parse_tucuman(url:str):
-    rec = parse_generic(url)
-    if not rec: return None
-    try:
-        data, ct, final = fetch_bytes(url)
-        html, enc = bytes_to_html(data, ct)
-        if html:
-            soup=BeautifulSoup(html,"html.parser"); full=cleanup_text(soup.get_text(" "))
-            if "salón nacional de tucumán" in full.lower():
-                rec["type"]="Concursos"
-                if "tucumán" not in rec["title"].lower():
-                    rec["title"]="Salón Nacional de Tucumán — " + rec["title"]
-            dl=extract_deadline(full); rec["deadline"]=dl or rec["deadline"]
-            for a in soup.select("a[href]"):
-                href=normalize_url(a["href"], final) or ""; tx=(a.get_text(" ") or "").lower()
-                if "inscrip" in tx or "postul" in tx: rec["links"]["inscripcion"]=href
-                if "base" in tx or "reglamento" in tx or href.lower().endswith(".pdf"): rec["links"]["bases"]=href
-    except Exception: pass
-    return rec
-
-def parse_osde(url:str):
-    rec = parse_generic(url)
-    if not rec: return None
-    try:
-        data, ct, final = fetch_bytes(url)
-        html, enc = bytes_to_html(data, ct)
-        if html:
-            soup=BeautifulSoup(html,"html.parser"); full=cleanup_text(soup.get_text(" "))
-            if "premio" in full.lower() and "osde" in full.lower():
-                rec["type"]="Concursos"
-                if "osde" not in rec["title"].lower():
-                    rec["title"]="Premio OSDE — " + rec["title"]
-            dl=extract_deadline(full); rec["deadline"]=dl or rec["deadline"]
-            for a in soup.select("a[href]"):
-                href=normalize_url(a["href"], final) or ""; tx=(a.get_text(" ") or "").lower()
-                if "inscrip" in tx or "postul" in tx: rec["links"]["inscripcion"]=href
-                if "base" in tx or "reglamento" in tx or href.lower().endswith(".pdf"): rec["links"]["bases"]=href
-    except Exception: pass
-    return rec
-
-DOMAIN_PARSERS = {
-    "klemm.org.ar": parse_klemm,
-    "premioklemm.klemm.org.ar": parse_klemm,
-    "fnartes.gob.ar": parse_fna,
-    "palaisdeglace.cultura.gob.ar": parse_palais,
-    "cultura.gob.ar": parse_palais,
-    "enteculturaltucuman.gob.ar": parse_tucuman,
-    "fundacionosde.com.ar": parse_osde,
-}
-
-def parse_page(url:str):
-    host=urlparse(url).netloc.lower().replace("www.","")
-    parser=DOMAIN_PARSERS.get(host, parse_generic)
-    return parser(url)
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Crawl AR curado
-# ────────────────────────────────────────────────────────────────────────────────
-def seems_call(url:str, text:str):
-    u=url.lower()
-    if any(k in u for k in ("/convocatoria","/convocatorias","/premio","/residenc","/salon","/salón","/beca")):
-        return True
-    s=(text or "").lower()
-    return any(k in s for k in ("convocatoria","premio","salón","salon","residenc","beca","open call","exposición","exposicion"))
-
-@st.cache_data(ttl=7200, show_spinner=False)
-def crawl_site_for_calls(seed:str, per_site_limit:int=12):
-    host=urlparse(seed).netloc
-    visited=set(); queue=[seed]; found=[]
-    while queue and len(visited)<per_site_limit:
-        url=queue.pop(0)
-        if url in visited: continue
-        visited.add(url)
-        try:
-            data, ct, final = fetch_bytes(url)
-            html, enc = bytes_to_html(data, ct)
-        except Exception:
-            continue
-        soup=BeautifulSoup(html or "<html></html>","html.parser")
-        text=cleanup_text(soup.get_text(" ")) if html else ""
-
-        if seems_call(url, text): found.append(url)
-
-        for a in soup.select("a[href]"):
-            href=a["href"].strip()
-            if not href or href.startswith("#") or href.startswith("mailto:"): continue
-            u=urljoin(url, href)
-            p=urlparse(u)
-            if p.netloc!=host: continue
-            if any(p.path.lower().endswith(ext) for ext in SKIP_EXTS): continue
-            if any(b in p.netloc for b in SKIP_HOSTS): continue
-            if u not in visited and u not in queue and len(queue) < per_site_limit*2:
-                queue.append(u)
-    uniq=[]; seen=set()
-    for u in found:
-        base=u.split("#")[0]
-        if base in seen: continue
-        seen.add(base); uniq.append(base)
-    return uniq[:per_site_limit]
-
-def gather_curated_ar(total_limit:int):
-    per=max(4, total_limit // max(1,len(CURATED_AR_SEEDS)))
-    urls=[]
-    for s in CURATED_AR_SEEDS:
-        urls += crawl_site_for_calls(s, per_site_limit=per)
-    clean=[]; seen=set()
-    for u in urls:
-        host=urlparse(u).netloc.lower()
-        if any(h in host for h in SKIP_HOSTS): continue
-        base=u.split("#")[0]
-        if base in seen: continue
-        seen.add(base); clean.append(base)
-        if len(clean)>=total_limit: break
-    return clean
-
-# ────────────────────────────────────────────────────────────────────────────────
-# FRONTEND (estilo “Hércules”)
-# ────────────────────────────────────────────────────────────────────────────────
-st.markdown('<div class="filterbox">', unsafe_allow_html=True)
-c1, c2 = st.columns([0.7,0.3])
-with c1: query = st.text_input("Búsqueda", placeholder="residencia, FNA, performance")
-with c2: ordenar = st.selectbox("Ordenar por", ["Fecha límite", "Dificultad", "Premio estimado"])
-
-c3, c4, c5 = st.columns([0.6,0.25,0.15])
-with c3:
-    categorias = st.multiselect("Categorias", ["Becas","Residencias","Concursos","Exposiciones","Convocatorias"],
-                                default=["Becas","Residencias","Concursos","Convocatorias"])
-with c4: ubicacion = st.selectbox("Ubicación", ["Todas","Argentina","Internacional"])
-with c5: sin_costo = st.checkbox("Solo convocatorias sin arancel", value=False)
-
-c6, c7, c8 = st.columns([0.25,0.25,0.5])
-with c6:  desde = st.date_input("Desde", value=None)
-with c7:  hasta = st.date_input("Hasta", value=None)
-with c8:  dificultad_max = st.slider("Dificultad máx. (100)", 10, 100, 100)
-
-c9, c10 = st.columns([0.3,0.7])
-with c9: do_search = st.button("Buscar", type="primary", use_container_width=True)
-with c10:
-    if st.button("Limpiar", use_container_width=True): st.experimental_rerun()
-st.markdown('</div>', unsafe_allow_html=True)
-
-# ────────────────────────────────────────────────────────────────────────────────
-# RUN
-# ────────────────────────────────────────────────────────────────────────────────
-if do_search:
-    t0=time.time()
-    urls = gather_curated_ar(total_limit=84)
-
-    results=[]; done=0; prog=st.progress(0)
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs=[ex.submit(parse_page,u) for u in urls]
-        for f in as_completed(futs):
-            rec=None
-            try: rec=f.result()
-            except: rec=None
-            if rec: results.append(rec)
-            done+=1; prog.progress(min(1.0, done/max(1,len(futs))))
-            if time.time()-t0 > HARD_TIME_LIMIT: break
-    prog.empty()
-
-    map_cats = {"Becas":"Becas","Residencias":"Residencias","Concursos":"Concursos","Exposiciones":"Exposiciones","Convocatorias":"Convocatorias"}
-
-    def keep(r):
-        if r.get("difficulty",100) > dificultad_max: return False
-        if sin_costo and not r.get("free"): return False
-        if ubicacion=="Argentina" and r.get("scope")!="AR": return False
-        if ubicacion=="Internacional" and r.get("scope")=="AR": return False
-        if categorias and r.get("type") not in [map_cats[c] for c in categorias]: return False
-        d=r.get("deadline")
-        if desde and d and d < desde: return False
-        if hasta and d and d > hasta: return False
-        if query:
-            blob=(r.get("title","")+" "+r.get("summary","")).lower()
-            if query.lower() not in blob: return False
-        return True
-
-    items=[x for x in results if keep(x)]
-
-    if ordenar=="Fecha límite":
-        items.sort(key=lambda r:(r.get("deadline") is None, r.get("deadline") or date(2100,1,1)))
-    elif ordenar=="Dificultad":
-        items.sort(key=lambda r:r.get("difficulty",100))
-    else:
-        def amt(r):
-            m=re.search(r"(\d[\d\.\,]+)", r.get("prize","") or "")
-            try: return -float(m.group(1).replace(".","").replace(",","."))
-            except: return 0
-        items.sort(key=amt)
-
-    left, right = st.columns([0.5,0.5])
-    with left: st.caption(f"**{len(items)} resultados**  ·  ⏱ {round(time.time()-t0,1)} s")
-    with right:
-        if items:
-            buf=io.StringIO(); w=csv.writer(buf)
-            w.writerow(["titulo","url","fuente","categoria","ubicacion","ambito","abre","cierra","dificultad","premio","cupos","fee","resumen"])
-            for c in items:
-                w.writerow([
-                    c["title"], c["url"], c["source"], c["type"], c["location"], c["scope"],
-                    c["open_at"].strftime("%Y-%m-%d") if c.get("open_at") else "",
-                    c["deadline"].strftime("%Y-%m-%d") if c.get("deadline") else "",
-                    c["difficulty"], c["prize"], c["slots"], c["fee"], c["summary"]
-                ])
-            st.download_button("📄 Exportar CSV", buf.getvalue(), "artify_convocatorias.csv", "text/csv")
-
-            def make_ics(items):
-                def dtfmt(d): return d.strftime("%Y%m%d")
-                ics=["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//Artify//Convocatorias//ES"]
-                for c in items:
-                    if not c.get("deadline"): continue
-                    desc=(c.get("summary","")[:200]).replace("\n"," ")
-                    ics+=["BEGIN:VEVENT",
-                          f"SUMMARY:{c['title']} (cierre)",
-                          f"DTSTART;VALUE=DATE:{dtfmt(c['deadline'])}",
-                          f"DTEND;VALUE=DATE:{dtfmt(c['deadline']+timedelta(days=1))}",
-                          f"DESCRIPTION:{desc}  URL: {c.get('url','')}",
-                          "END:VEVENT"]
-                ics.append("END:VCALENDAR")
-                return "\n".join(ics)
-            st.download_button("📅 Exportar ICS", make_ics(items), "artify_convocatorias.ics", "text/calendar")
-
-    st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
-
-    if not items:
-        st.info("No hubo resultados con estos filtros. Probá quitar 'sin costo', ampliar fecha o dificultad.")
-
-    for r in items:
-        open_txt = r["open_at"].strftime("%d/%m/%Y") if r.get("open_at") else "—"
-        dl=r.get("deadline")
-        dl_txt = dl.strftime("%d/%m/%Y") if dl else "Sin dato"
-        left = days_left(dl)
-        urgency = "🟢" if left is None else ("🟡" if left and left<=21 else "🟢")
-        if left is not None and left <= 7: urgency="🔴"
-
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        hA, hB = st.columns([0.72,0.28])
-        with hA:
-            st.markdown(f"### {r['title']}")
-            chips = " ".join([
-                f"<span class='badge'>{r['type']}</span>",
-                f"<span class='badge'>{r['location']}</span>",
-                f"<span class='badge'>{r['source']}</span>",
-                f"<span class='badge'>{'Sin costo' if r.get('free') else 'Con arancel'}</span>",
-            ])
-            st.markdown(chips, unsafe_allow_html=True)
-            st.markdown(f"<div class='meta'><b>Abre:</b> {open_txt} &nbsp;•&nbsp; <b>Cierra:</b> {dl_txt} {f'({left} días)' if left is not None else ''} &nbsp;{urgency}</div>", unsafe_allow_html=True)
-            st.write(r["summary"])
-        with hB:
-            st.metric("Dificultad (1–100)", r["difficulty"])
-            st.markdown("<div class='kpis'>", unsafe_allow_html=True)
-            st.markdown(f"<span class='pill'>Premio: {r['prize']}</span>", unsafe_allow_html=True)
-            st.markdown(f"<span class='pill'>Cupos: {r['slots']}</span>", unsafe_allow_html=True)
-            st.markdown(f"<span class='pill'>Fee: {r['fee']}</span>", unsafe_allow_html=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-            st.markdown("<div class='btn-row'>", unsafe_allow_html=True)
-            links=r.get("links",{})
-            if links.get("inscripcion"): link_button("📝 Postular / Inscripción", links["inscripcion"])
-            if links.get("bases"):       link_button("📄 Bases / Reglamento",   links["bases"])
-            link_button("🌐 Abrir publicación", links.get("principal") or r["url"])
-            st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-else:
-    st.info("Elegí filtros y dale a **Buscar**. Ya maneja PDFs sin texto legible y mejora títulos automáticamente.")
+        if not html:
+            domain=urlparse(final).netloc.replace("www.","")
+            fname = final.split("/")[-1]
+            title = smart_title_guess(fname, "", domain)
+            return {
+                "source": domain, "title": title or f"Documento PDF — {domain}", "url": final,
+                "open_at": None, "deadline": None, "type": "Convocatorias",
+                "location":"—","scope":"UNK", "prize":"—","slots":"—","fee":"0","
